@@ -49,24 +49,31 @@ behavior and code structure:
 - Find all symbols that throw unhandled exceptions in production traces
 - Add caching to expensive computations identified from OTel span duration data
 
-These two query types cover most of what a senior engineer does day to day — not just
-writing code but reasoning about a codebase at scale.
+**Browser runtime queries** (CDP):
+- Find CSS rules with zero matches across real user journeys, remove with certainty
+- Diff server vs client component output to locate hydration mismatches
+- Trace re-render cascades to their responsible symbols and memoize atomically
+
+These query types cover most of what a senior engineer does day to day — not just writing
+code but reasoning about a codebase at scale.
 
 ---
 
 ## Feedback loop
 
-The system closes the full agent feedback loop across four layers:
+The system closes the full agent feedback loop across five layers:
 
 - **CST** — valid structure enforced at schema level; lossless roundtrips via concrete
   syntax tree (comments, trivia preserved)
 - **LSP** — type and semantic errors caught before commit
-- **REPL** — runtime behavior validated during development
-- **OTel traces** — execution history queryable as data, enabling session replay
+- **REPL** — server-side runtime behavior validated during development
+- **CDP** — browser runtime behavior captured and traced; completes the full stack
+- **OTel traces** — execution history from both REPL and CDP queryable as data,
+  enabling session replay across server and browser
 
-Agents read traces to diagnose failures rather than stepping through a debugger. Root
-cause analysis becomes a chained query across traces and the symbol graph — no
-reproduction required.
+All traces — server OTel spans and browser CDP traces — land in the same `traces` table.
+Agent queries runtime behavior across the full stack in one place: server latency, browser
+paint time, and JS exceptions all joinable against the symbol graph.
 
 ---
 
@@ -81,7 +88,7 @@ by the time it reaches those gates.
 
 ```
 1. query    → understand reality (graph + traces)
-2. REPL     → grow solution against real data (red → green)
+2. REPL/CDP → grow solution against real data (red → green)
 3. commit   → persist to graph atomically (LSP clean, unit tests pass)
 4. swarm    → scale across codebase in one transaction
 5. pre-commit hook → existing gates fire against materialized files
@@ -109,28 +116,83 @@ Unit tests live in the REPL loop, pre-commit, validated against real data. Integ
 tests live post-commit in the materialized sandbox. That boundary is enforced by the
 architecture, not by convention.
 
-**Example: add input validation to all untrusted entry points**
+**Git compatibility:**
+
+The pre-commit hook materializes files and runs whatever checks the project already has.
+Git sees a conventional file tree. CI sees a conventional file tree. No changes required
+to existing pipelines. Teams adopt the graph layer without touching their infrastructure.
+
+---
+
+## Use cases
+
+These are the scenarios that best demonstrate the value of the full system. Each one
+represents a class of work that currently takes a senior engineer hours or days. Here
+each is a query pipeline producing structured data at every step.
+
+---
+
+**Add input validation to all untrusted entry points**
+
+The canonical security audit. Currently: a senior engineer reads code paths manually,
+guesses at edge cases, writes tests against invented inputs. Here:
 
 ```
-query graph   → find every path from HTTP entry point to DB sink
-                with no validator in between
+graph_query   → find every path from HTTP entry point to DB sink
+                with no validator node in between (reachability)
 REPL          → draft validator
               → red: unguarded input reaches DB
-              → test against real traced production inputs
+              → test against real traced production inputs — not invented fixtures
               → green
-commit        → validator to graph, LSP confirms types hold
+commit        → validator to graph, LSP confirms types hold everywhere
 swarm         → insert validator at every unguarded path, one transaction
 pre-commit    → eslint, tsc, existing test suite fire against materialized files
 CI            → integration tests, docker build, deploy
 ```
 
-The trace-as-fixtures step is the sharpest delta from today. You are not imagining
-edge cases — you are replaying what production actually sent.
+You are not imagining edge cases. You are replaying what production actually sent. The
+swarm step scales a validated solution across the entire codebase atomically — no
+partially-patched state possible.
 
-**Example: add DB indexes for slow queries**
+---
+
+**Fix SSR hydration mismatch**
+
+Hydration mismatches are among the hardest frontend bugs to locate. You see the error
+but finding which data diverges between server and client requires manual bisection.
+This is the scenario where CDP and the server REPL working together is uniquely powerful:
 
 ```
-trace_query   → find spans averaging >100ms
+CDP session   → capture SSR HTML at server render time
+              → capture client hydration attempt
+              → record exact DOM node where mismatch fires
+trace_query   → find exception span, stack frame, component symbol
+graph_query   → find that component
+              → query all data sources it reads server-side vs client-side
+              → find symbols that return different values in each context
+REPL          → eval component in Node context → capture output
+CDP           → eval same component in browser context → capture output
+              → diff the two outputs, isolate diverging symbol
+              → fix: make data fetching context-agnostic
+              → replay hydration → no mismatch → green
+commit        → graph
+pre-commit    → tsc confirms types hold
+CI            → SSR integration test suite
+```
+
+Neither the REPL nor CDP alone gets you here. The diff between two evals against the
+same symbol in two different runtime contexts is what collapses a multi-hour debug
+session into a single query.
+
+---
+
+**Add DB indexes for all slow query patterns found in traces**
+
+The canonical performance audit. Currently: manually profile, manually read query plans,
+manually write migrations, manually verify improvement. Here:
+
+```
+trace_query   → find spans averaging >100ms, grouped by query pattern
 graph_query   → find emitting symbols, identify unindexed columns
 REPL          → draft migration
               → materialize sandbox DB
@@ -142,30 +204,8 @@ pre-commit    → existing migration linting fires
 CI            → integration tests run against migrated schema, deploy
 ```
 
-You ship an index you already measured fixing the problem. Not hoped.
-
-**Example: generate OpenAPI spec from live symbol graph**
-
-```
-graph_query   → extract route symbols, input/output types, auth guards
-REPL          → grow spec materializer interactively
-              → red: missing nullable fields, wrong error responses
-              → refine against real traced request/response pairs
-              → green
-commit        → materializer to graph
-materialize   → spec file lands in repo alongside code on every commit
-pre-commit    → openapi-lint fires against materialized spec
-CI            → contract tests against generated spec
-```
-
-The spec is never stale because it materializes from the live graph. Changing a route
-handler's return type updates the spec automatically on next materialization.
-
-**Git compatibility:**
-
-The pre-commit hook materializes files and runs whatever checks the project already has.
-Git sees a conventional file tree. CI sees a conventional file tree. No changes required
-to existing pipelines. Teams adopt the graph layer without touching their infrastructure.
+You ship an index you already measured fixing the problem. The evidence is in the traces
+before you write a line. The validation is in new traces before you commit.
 
 ---
 
@@ -186,6 +226,29 @@ work from the live runtime into the persistent graph. You grow the program from 
 live runtime and persist when confident — the Clojure REPL model, applied to TypeScript
 and Python, grounded in real production data.
 
+CDP extends this to the browser. Every interaction, every component state, every network
+request is traceable and replayable. Server and browser become two REPL contexts over
+the same symbol graph.
+
+---
+
+## Smaller models on larger codebases
+
+The system externalizes exactly the capabilities smaller models lack on large codebases:
+
+- "What will break if I change this?" — graph query, not file reading
+- "Where is this defined?" — symbol lookup, not grep
+- "Is this change globally consistent?" — LSP pre-commit, not hope
+
+Instead of dumping files into context, an agent queries for exactly what it needs.
+`symbol_query("processPayment")` returns definition, callers, and type dependencies —
+fits in context regardless of repo size. The graph does the navigation. The model
+handles reasoning and generation.
+
+The floor rises dramatically even if the ceiling stays the same. Smaller, cheaper, faster
+models become reliably safe on large codebases. This may be the most practically valuable
+property of the system.
+
 ---
 
 ## Storage
@@ -196,7 +259,7 @@ One database holds the full working state. Four tables:
 - `nodes(id, file_id, kind, parent_id, start, end, properties)` — every CST node
 - `symbols(id, name, kind, definition_node_id, version)` — cross-file semantic index
 - `traces(id, span_id, parent_span_id, name, start_time, end_time, attributes JSON)`
-  — OTel spans from the REPL pool; runtime behavior alongside code structure
+  — OTel spans from REPL and CDP traces; full-stack runtime behavior alongside code
 
 File boundaries matter only as import contracts and materialization paths. Inside the DB
 they are foreign keys, not organizing principles. A cross-file refactor is a query across
@@ -231,7 +294,7 @@ git clone
     ↓
 hydrate: parse source → populate graph (tree-sitter; low seconds for 50k-line repo)
     ↓
-agents work in graph: query, mutate, validate, eval
+agents work in graph: query, mutate, validate, eval, trace
     ↓
 materialize: graph → chosen projection (file tree, API spec, service split, etc.)
     ↓
@@ -281,11 +344,12 @@ session_init()                    // file tree + symbol graph
 symbol_query(name)                // definition + references
 node_mutate(fileId, mutation)     // structural edit + LSP validation
 eval(expression, language)        // materialize + REPL + OTel
+cdp_session(url)                  // attach browser runtime + capture traces
 snapshot_create(name)
 snapshot_restore(id)
 materialize_to_sandbox(fileIds)   // for fs-native tool runs
 hydrate_from_sandbox(path, paths)
-trace_query(sql)                  // query OTel spans
+trace_query(sql)                  // query OTel + CDP spans
 graph_query(cypher)               // V2: native graph traversal
 ```
 
