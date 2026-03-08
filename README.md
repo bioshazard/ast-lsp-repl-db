@@ -1,68 +1,226 @@
-# AST-SQLite Agent Scratchpad
+# Queryable Codebase
 
-AI agent swarms perform large-scale, transactional refactors across hundreds of files by
-operating on a SQLite database of parsed AST nodes instead of raw text. Git stays the
-durable source of truth. SQLite is the structured working layer for the duration of a
-swarm session. Text files are a derived artifact, not a canonical representation.
+A codebase is a graph. This system makes it queryable.
+
+Every hard problem in large-scale software — security audits, performance optimization,
+API documentation, dependency management, service decomposition — is currently solved by
+humans reading files. This system makes those problems queries. Agents operate on the
+graph directly. Text files, API specs, service boundaries, and deployment topologies are
+all projections of the same underlying structure, materialized on demand.
 
 ---
 
-## Why
+## The core idea
 
-Text-based editing is the wrong primitive for agents. Agents produce syntactically
-malformed code, create merge conflicts on concurrent edits, and have no native way to
-express semantic changes like "rename this function everywhere it's called." SQLite over
-AST nodes solves all three: the schema enforces valid structure, OCC versioning detects
-semantic conflicts before commit, and cross-file queries ("find every caller of
-processPayment") are plain SQL.
+Code is not text that happens to have structure. Code is structure that happens to be
+renderable as text. The file tree is one possible view over the data — the one humans and
+CI pipelines expect. It is not the canonical representation.
+
+The canonical representation is a graph of symbols, nodes, and their relationships. From
+that graph you can materialize:
+
+- A conventional file tree (for git, CI, humans)
+- Module interfaces (for consumers and type checking)
+- An OpenAPI spec (generated from live route symbols, always current)
+- A flat bundle (for edge deployment)
+- Independent services (partitioned at clean module boundary cut points)
+- A semantic changelog (symbol-level diff between versions, not line diffs)
+
+The graph doesn't know or care which projection you choose. Agents operate on the graph.
+Materialization is a rendering decision made at deploy time.
+
+**The file is not the atom. The symbol is.**
+
+---
+
+## What this unlocks
+
+Every interesting agentic task is either a reachability query or a join between runtime
+behavior and code structure:
+
+**Reachability queries** (graph-native):
+- Find every caller of this function across 300 files
+- Trace untrusted input from HTTP entry point to database sink without passing a validator
+- Find all circular dependencies that block microservice extraction
+- Detect dead code with no reachable callers from any entry point
+
+**Runtime + structure joins** (relational):
+- Find DB queries averaging >100ms in traces, identify missing indexes, generate migrations
+- Find all symbols that throw unhandled exceptions in production traces
+- Add caching to expensive computations identified from OTel span duration data
+
+These two query types cover most of what a senior engineer does day to day — not just
+writing code but reasoning about a codebase at scale.
+
+---
+
+## Feedback loop
 
 The system closes the full agent feedback loop across four layers:
-- **CST/AST** — valid structure enforced at the schema level; lossless roundtrips
+
+- **CST** — valid structure enforced at schema level; lossless roundtrips via concrete
+  syntax tree (comments, trivia preserved)
 - **LSP** — type and semantic errors caught before commit
 - **REPL** — runtime behavior validated during development
 - **OTel traces** — execution history queryable as data, enabling session replay
 
-Together these cover everything an agent needs during a swarm session. Integration and
-e2e tests require a fully materialized environment and belong to the CI pipeline at deploy
-time, not the swarm session itself.
+Agents read traces to diagnose failures rather than stepping through a debugger. Root
+cause analysis becomes a chained query across traces and the symbol graph — no
+reproduction required.
 
 ---
 
-## Core structure
+## SDLC
 
-One SQLite database holds the full working state of the project. Four tables carry the
-load:
+The system adds a faster inner loop. It does not replace existing outer loops. Every
+existing gate — linters, type checkers, test suites, CI pipelines — still fires against
+real materialized files, unchanged. The graph layer means code is already well-validated
+by the time it reaches those gates.
 
-- `files(id, path, language)` — one row per source file
-- `nodes(id, file_id, kind, parent_id, start, end, properties)` — every AST node,
-  normalized and relational
-- `symbols(id, name, kind, definition_node_id, version)` — cross-file semantic index,
-  populated and maintained by the LSP server
+**The six-step flow:**
+
+```
+1. query    → understand reality (graph + traces)
+2. REPL     → grow solution against real data (red → green)
+3. commit   → persist to graph atomically (LSP clean, unit tests pass)
+4. swarm    → scale across codebase in one transaction
+5. pre-commit hook → existing gates fire against materialized files
+6. CI       → integration, e2e, deploy (unchanged)
+```
+
+Steps 1–4 are agent-native and new. Steps 5–6 are existing tooling, parasitized cleanly.
+
+**Red/green in this system:**
+
+Traditional TDD specifies behavior before implementation using invented fixtures. Here
+the OTel trace table is a library of real inputs that already caused real behavior in
+production. Red/green stops being "does it pass my imagined inputs" and becomes "does it
+pass what production actually threw at it."
+
+```
+write symbol: processPayment (interface only)
+query traces: find all real inputs that hit this path
+REPL: run test against symbol → red (not implemented)
+      grow implementation until green against real inputs
+commit: symbol + implementation + test as one atomic transaction
+```
+
+Unit tests live in the REPL loop, pre-commit, validated against real data. Integration
+tests live post-commit in the materialized sandbox. That boundary is enforced by the
+architecture, not by convention.
+
+**Example: add input validation to all untrusted entry points**
+
+```
+query graph   → find every path from HTTP entry point to DB sink
+                with no validator in between
+REPL          → draft validator
+              → red: unguarded input reaches DB
+              → test against real traced production inputs
+              → green
+commit        → validator to graph, LSP confirms types hold
+swarm         → insert validator at every unguarded path, one transaction
+pre-commit    → eslint, tsc, existing test suite fire against materialized files
+CI            → integration tests, docker build, deploy
+```
+
+The trace-as-fixtures step is the sharpest delta from today. You are not imagining
+edge cases — you are replaying what production actually sent.
+
+**Example: add DB indexes for slow queries**
+
+```
+trace_query   → find spans averaging >100ms
+graph_query   → find emitting symbols, identify unindexed columns
+REPL          → draft migration
+              → materialize sandbox DB
+              → replay slow traced queries against it
+              → new spans confirm duration dropped
+              → green
+commit        → migration to graph
+pre-commit    → existing migration linting fires
+CI            → integration tests run against migrated schema, deploy
+```
+
+You ship an index you already measured fixing the problem. Not hoped.
+
+**Example: generate OpenAPI spec from live symbol graph**
+
+```
+graph_query   → extract route symbols, input/output types, auth guards
+REPL          → grow spec materializer interactively
+              → red: missing nullable fields, wrong error responses
+              → refine against real traced request/response pairs
+              → green
+commit        → materializer to graph
+materialize   → spec file lands in repo alongside code on every commit
+pre-commit    → openapi-lint fires against materialized spec
+CI            → contract tests against generated spec
+```
+
+The spec is never stale because it materializes from the live graph. Changing a route
+handler's return type updates the spec automatically on next materialization.
+
+**Git compatibility:**
+
+The pre-commit hook materializes files and runs whatever checks the project already has.
+Git sees a conventional file tree. CI sees a conventional file tree. No changes required
+to existing pipelines. Teams adopt the graph layer without touching their infrastructure.
+
+---
+
+## Live development
+
+The REPL is not a validation step bolted onto the graph. It is a peer to the graph —
+two views of the same program, one structural and persistent, one live and exploratory.
+
+```
+eval: define a new function → exists in runtime immediately
+eval: call it with real traced inputs → see actual behavior
+eval: refine → redefine in place
+commit: when satisfied → write back to graph
+```
+
+The graph is the save state. The REPL is the workspace. Commit is the gesture that moves
+work from the live runtime into the persistent graph. You grow the program from inside a
+live runtime and persist when confident — the Clojure REPL model, applied to TypeScript
+and Python, grounded in real production data.
+
+---
+
+## Storage
+
+One database holds the full working state. Four tables:
+
+- `files(id, path, language)` — materialization targets; import boundary markers
+- `nodes(id, file_id, kind, parent_id, start, end, properties)` — every CST node
+- `symbols(id, name, kind, definition_node_id, version)` — cross-file semantic index
 - `traces(id, span_id, parent_span_id, name, start_time, end_time, attributes JSON)`
-  — OTel spans emitted by the REPL pool, queryable alongside code structure
+  — OTel spans from the REPL pool; runtime behavior alongside code structure
 
-The `symbols.version` column is the concurrency primitive. Any mutation that changes a
-symbol's name, signature, or type increments its version. Two agents mutating the same
-symbol concurrently produce a version mismatch at commit time; the second transaction
-aborts. Reference insertions (new call sites) are non-conflicting inserts and compose
+File boundaries matter only as import contracts and materialization paths. Inside the DB
+they are foreign keys, not organizing principles. A cross-file refactor is a query across
+`file_id`s. Moving a function between files is `UPDATE nodes SET file_id = ?`.
+
+**Graph vs relational:** code structure and traversal queries are native graph operations.
+Runtime behavior (traces, aggregates, joins) is native relational. V1 uses SQLite —
+pragmatic, embedded, ships fast. V2 evaluates Kuzu (embedded graph DB, Cypher queries,
+zero-infra) with DuckDB alongside for relational and trace queries. The materialization
+layer is decoupled from storage and stays identical across the swap.
+
+---
+
+## Concurrency
+
+`symbols.version` is the concurrency primitive. Any mutation to a symbol's name,
+signature, or type increments its version. Second writer on the same symbol sees a
+version mismatch and aborts. New reference insertions are non-conflicting and compose
 freely.
 
-The `traces` table turns the DB into a unified development intelligence layer — code
-structure and runtime behavior in one place, one query interface.
+**V1 gap:** write-write conflicts detected; read-set staleness is not. Mitigated by
+mandatory pre-commit LSP re-validation. Full OCC via transaction manifest deferred to V2.
 
----
-
-## AST vs CST
-
-The system uses CST (Concrete Syntax Tree) not AST (Abstract Syntax Tree) where
-possible. AST strips trivia — comments, whitespace, formatting. CST preserves it. Lossless
-roundtrips require CST; without it comments are lost on the first materialize cycle.
-
-- **TypeScript** — ts-morph and the compiler API model trivia natively, CST by default
-- **Python** — libcst required; stdlib `ast` strips comments entirely and cannot be used
-
-This is a hard library constraint, not a preference. Each additional language must provide
-a CST-capable parser to be supported.
+Abort returns a conflict error. Retry policy is caller-defined.
 
 ---
 
@@ -71,202 +229,89 @@ a CST-capable parser to be supported.
 ```
 git clone
     ↓
-hydrate: tree-sitter parses source files → populate SQLite (nodes + symbols)
-         fast enough that a 50k-line repo completes in low seconds
-         runs once on clone, again on pull
+hydrate: parse source → populate graph (tree-sitter; low seconds for 50k-line repo)
     ↓
-agents work: query symbols, mutate AST, run LSP diagnostics, commit transactions
-             REPL evals emit OTel spans → traces table
+agents work in graph: query, mutate, validate, eval
     ↓
-materialize: deterministic tree walk → formatted source text
+materialize: graph → chosen projection (file tree, API spec, service split, etc.)
     ↓
 git commit → DB discarded
 ```
 
-Git handles history, branching, and merging. SQLite handles structured edits during the
-session. The DB is ephemeral, per-session, and never committed to git. When the swarm
-completes and you materialize for git commit, the DB is discarded entirely.
+Git is the durable save state. The DB is ephemeral, per-session, never committed.
+Worktrees are reflink copies of the DB file plus a corresponding git worktree — branching
+is a filesystem primitive on CoW filesystems (btrfs, APFS, ZFS).
 
 ---
 
 ## Editing flow
 
-An agent starts a session by calling `session_init`, which returns the file tree and
-top-level symbol graph as context. It then queries `symbols` for specific definitions and
-references before planning any mutation.
+Every structural edit:
+1. Mutates the graph in the DB
+2. Materializes a fresh text buffer (deterministic tree walk, low single-digit ms)
+3. Pushes buffer as `textDocument/didChange` to keep LSP virtual document consistent
 
-To make a change, the agent mutates the AST in-memory — rename a function, add a
-parameter, insert a node — then runs LSP diagnostics on the updated tree. If checks pass,
-it commits inside one database transaction.
-
-LSP coherence requires materialization on the hot path. Every structural edit must:
-1. Mutate the AST in the DB
-2. Materialize a fresh text buffer for the affected file (deterministic tree walk,
-   low single-digit ms)
-3. Send that buffer as a `textDocument/didChange` payload to keep the LSP server's
-   virtual document consistent
-
-For editor-integrated LSP (OpenCode, Cursor), skip the virtual document approach entirely
-— write the materialized file to the actual worktree path on commit and let the editor's
-file watcher handle LSP sync naturally.
-
-**Conflict behavior:** abort returns a conflict error; retry policy is caller-defined.
-Agents may retry with backoff or escalate to MCP arbitration.
-
-**Known V1 gap:** write-write conflicts on the same symbol are detected. Read-set
-staleness (agent reads symbol at version N, another agent mutates to N+1 before the
-first commits) is not detected at the DB layer. Mitigated by mandatory pre-commit LSP
-re-validation, which surfaces most invalid semantic changes. Full read-set OCC via
-transaction manifest is deferred to V2.
-
----
-
-## Execution and diagnostics
-
-The DB never executes. On any eval request:
-1. Materialize affected files to a temporary filesystem sandbox
-2. Apply the canonical formatter (Black for Python, Prettier for TypeScript)
-3. Feed formatted source to a warm, persistent runtime (Python REPL, Bun process)
-4. OTel SDK — initialized once in the REPL process — emits spans automatically for every
-   call, exception, and slow operation
-5. Spans route to the `traces` table in the same SQLite DB
-6. Stream stdout, return values, and errors back to the agent
-7. DB remains unchanged unless the agent explicitly commits a new AST edit
-
-**REPL staleness:** each commit emits a list of affected module paths. The REPL pool
-marks sessions dirty for those paths. Next eval on a dirty session forces a re-import
-before executing.
-
-**Session replay over step debugging:** agents query the `traces` table to reconstruct
-execution history rather than stepping through a debugger interactively. "Show me all
-spans where processPayment exceeded 100ms" is a SQL query. This is the agent-native
-diagnostic primitive — read the trace, reason over it, form a hypothesis, mutate, verify.
-DAP-based step debugging is available for human handoff but is not the primary agent
-workflow. rr (deterministic record/replay at syscall level) is deferred to V2 for the
-rare class of bugs that require it.
-
----
-
-## Worktrees
-
-The worktree analog is a reflink copy of the DB file (`cp --reflink` on btrfs/APFS —
-near-instant). Each branch gets an independent DB file and a corresponding git worktree.
-Agents work in full isolation with no WAL contention between branches.
-
-**Requires a CoW filesystem** (btrfs, APFS, ZFS). Falls back to a full copy on ext4 —
-functional but slower. Document this constraint explicitly for contributors.
-
-```bash
-# bootstrap once per repo
-bunx ast-sqlite hydrate
-
-# every session is a worktree
-bunx ast-sqlite worktree add --branch <name>   # git worktree + reflink db + start MCP
-bunx ast-sqlite worktree materialize           # write files → git commit
-bunx ast-sqlite worktree discard               # git worktree remove + delete db
-```
-
-`worktree discard` calls `git worktree remove` internally — git and db lifecycle stay
-strictly coupled and cannot diverge. The main db is the hydrated base; agents never
-mutate it directly.
-
-Agents can also explore inside an open uncommitted transaction without creating a
-worktree. Mutate, eval, inspect — then commit or rollback for free. The open transaction
-is the scratchpad for short explorations.
+For editor-integrated LSP (OpenCode, Cursor): write materialized file to actual worktree
+path on commit; file watcher handles LSP sync naturally.
 
 ---
 
 ## Snapshots
 
-`snapshot_create(name)` tags the current DB savepoint and returns a snapshot ID.
-Savepoints are SQLite-native and don't persist beyond the session — no GC required.
-
-`snapshot_restore(id)` executes a full three-system reset in this order:
-1. Quiesce REPL pool — drain or cancel in-flight evals; callers receive a
-   `snapshot-restore` error code
-2. `ROLLBACK TO savepoint_{id}`
-3. `textDocument/didClose` all affected files (batch — close all before opening any)
-4. Materialize T1 source for all affected files from the restored AST
-5. `textDocument/didOpen` all affected files with T1 source (batch)
-6. Mark affected REPL sessions dirty
-7. Return `{snapshot_id, affected_files: [...]}`
-
-The two-phase close/open batch (step 3 before step 5) ensures the LSP rebuilds its
-semantic graph against a fully consistent T1 snapshot rather than a partially-restored
-mix. This is the escape hatch when a swarm goes sideways across 50 files.
+`snapshot_restore` is a three-system reset: quiesce REPL pool → DB rollback → LSP
+didClose all affected (batch) → materialize T1 source → LSP didOpen all affected (batch)
+→ mark REPL sessions dirty. Two-phase batch ensures LSP rebuilds from consistent state.
+Savepoints are SQLite-native; no GC required.
 
 ---
 
-## Filesystem interop
+## CLI and MCP surface
 
-Some operations are fundamentally filesystem-native: package managers, compilers, test
-runners. The system handles these with an explicit materialize → run → hydrate cycle:
+```bash
+# lifecycle (humans + CI)
+ast-sqlite hydrate
+ast-sqlite worktree add --branch <n>
+ast-sqlite worktree materialize [--target openapi|files|services]
+ast-sqlite worktree discard
+```
 
-1. **Materialize** — write relevant files to a temp sandbox
-2. **Run the tool** — `bun install`, `tsc`, `pytest`, etc.
-3. **Hydrate** — pull results back into the DB explicitly
+```typescript
+// agent tools (MCP)
+session_init()                    // file tree + symbol graph
+symbol_query(name)                // definition + references
+node_mutate(fileId, mutation)     // structural edit + LSP validation
+eval(expression, language)        // materialize + REPL + OTel
+snapshot_create(name)
+snapshot_restore(id)
+materialize_to_sandbox(fileIds)   // for fs-native tool runs
+hydrate_from_sandbox(path, paths)
+trace_query(sql)                  // query OTel spans
+graph_query(cypher)               // V2: native graph traversal
+```
 
-**Hydrate:** source files, config files, lockfiles, generated type stubs.
-**Don't hydrate:** `node_modules`, `__pycache__`, `dist`, `.next` — anything
-deterministically derivable from DB state. These reconstruct JIT from the lockfile on
-each sandbox spin-up. The sandbox caches between evals when the lockfile hash is
-unchanged.
+`.mcp.json` in the repo root enables automatic agent discovery via any MCP-aware client.
 
 ---
 
 ## Language scope (V1)
 
-**TypeScript** — CST via ts-morph or the compiler API. LSP via tsserver.
+**TypeScript** — ts-morph / compiler API (trivia-preserving, CST by default). LSP via
+tsserver.
 
-**Python** — CST via libcst (not stdlib `ast`). LSP via pyright.
+**Python** — libcst required; stdlib `ast` strips comments and cannot be used. LSP via
+pyright.
 
-Each additional language requires: CST-capable parser, AST schema, materializer, LSP
-integration. Scope stays narrow in V1.
-
----
-
-## MCP and CLI surface
-
-MCP for agents. CLI for humans and CI.
-
-```bash
-# CLI — lifecycle boundaries
-ast-sqlite hydrate
-ast-sqlite worktree add --branch <name>
-ast-sqlite worktree materialize
-ast-sqlite worktree discard
-```
-
-```typescript
-// MCP tools — agent session
-session_init()                                    // file tree + symbol graph
-symbol_query(name)                                // definition + references
-node_mutate(fileId, mutation)                     // structural edit + LSP validation
-eval(expression, language)                        // materialize + REPL + OTel
-snapshot_create(name)                             // tag savepoint
-snapshot_restore(id)                              // full three-system reset
-materialize_to_sandbox(fileIds)                   // for fs-native tool runs
-hydrate_from_sandbox(sandboxPath, paths)          // pull results back
-trace_query(sql)                                  // query OTel spans directly
-```
-
-Add to `.mcp.json` for automatic agent discovery:
-```json
-{
-  "mcpServers": {
-    "ast-sqlite": {
-      "command": "bunx",
-      "args": ["ast-sqlite", "mcp", "--repo", "."]
-    }
-  }
-}
-```
+Each additional language requires a CST-capable parser, schema, materializer, and LSP
+integration.
 
 ---
 
 ## What this is not
 
-This system does not replace Git for humans. Developers clone, branch, and commit
-normally. The SQLite layer exists only for the duration of a swarm session. At the end,
-the materialized output is a conventional project tree that any existing CI pipeline
-consumes unchanged.
+A replacement for Git, a new version control system, or a tool for humans editing code
+directly. Git handles history. Humans work normally. The graph layer exists only for the
+duration of a swarm session, then discards itself. The materialized output is a
+conventional project tree any existing CI pipeline consumes unchanged.
+
+The shift is not in how code is stored long-term. The shift is in what becomes possible
+during the session when agents have a queryable graph instead of a pile of text files.
