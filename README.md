@@ -16,10 +16,11 @@ AST nodes solves all three: the schema enforces valid structure, OCC versioning 
 semantic conflicts before commit, and cross-file queries ("find every caller of
 processPayment") are plain SQL.
 
-The system closes the full agent feedback loop:
-- **LSP** catches structural and type errors before commit
-- **REPL** catches runtime errors during development
-- **SQLite** provides the transactional substrate and audit trail
+The system closes the full agent feedback loop across four layers:
+- **CST/AST** — valid structure enforced at the schema level; lossless roundtrips
+- **LSP** — type and semantic errors caught before commit
+- **REPL** — runtime behavior validated during development
+- **OTel traces** — execution history queryable as data, enabling session replay
 
 Together these cover everything an agent needs during a swarm session. Integration and
 e2e tests require a fully materialized environment and belong to the CI pipeline at deploy
@@ -29,7 +30,7 @@ time, not the swarm session itself.
 
 ## Core structure
 
-One SQLite database holds the full working state of the project. Three tables carry the
+One SQLite database holds the full working state of the project. Four tables carry the
 load:
 
 - `files(id, path, language)` — one row per source file
@@ -37,12 +38,31 @@ load:
   normalized and relational
 - `symbols(id, name, kind, definition_node_id, version)` — cross-file semantic index,
   populated and maintained by the LSP server
+- `traces(id, span_id, parent_span_id, name, start_time, end_time, attributes JSON)`
+  — OTel spans emitted by the REPL pool, queryable alongside code structure
 
 The `symbols.version` column is the concurrency primitive. Any mutation that changes a
 symbol's name, signature, or type increments its version. Two agents mutating the same
 symbol concurrently produce a version mismatch at commit time; the second transaction
 aborts. Reference insertions (new call sites) are non-conflicting inserts and compose
 freely.
+
+The `traces` table turns the DB into a unified development intelligence layer — code
+structure and runtime behavior in one place, one query interface.
+
+---
+
+## AST vs CST
+
+The system uses CST (Concrete Syntax Tree) not AST (Abstract Syntax Tree) where
+possible. AST strips trivia — comments, whitespace, formatting. CST preserves it. Lossless
+roundtrips require CST; without it comments are lost on the first materialize cycle.
+
+- **TypeScript** — ts-morph and the compiler API model trivia natively, CST by default
+- **Python** — libcst required; stdlib `ast` strips comments entirely and cannot be used
+
+This is a hard library constraint, not a preference. Each additional language must provide
+a CST-capable parser to be supported.
 
 ---
 
@@ -56,6 +76,7 @@ hydrate: tree-sitter parses source files → populate SQLite (nodes + symbols)
          runs once on clone, again on pull
     ↓
 agents work: query symbols, mutate AST, run LSP diagnostics, commit transactions
+             REPL evals emit OTel spans → traces table
     ↓
 materialize: deterministic tree walk → formatted source text
     ↓
@@ -85,8 +106,9 @@ LSP coherence requires materialization on the hot path. Every structural edit mu
 3. Send that buffer as a `textDocument/didChange` payload to keep the LSP server's
    virtual document consistent
 
-Without step 3, the LSP's semantic graph drifts from the DB state and cross-file
-references go stale.
+For editor-integrated LSP (OpenCode, Cursor), skip the virtual document approach entirely
+— write the materialized file to the actual worktree path on commit and let the editor's
+file watcher handle LSP sync naturally.
 
 **Conflict behavior:** abort returns a conflict error; retry policy is caller-defined.
 Agents may retry with backoff or escalate to MCP arbitration.
@@ -99,19 +121,29 @@ transaction manifest is deferred to V2.
 
 ---
 
-## Execution flow
+## Execution and diagnostics
 
 The DB never executes. On any eval request:
 1. Materialize affected files to a temporary filesystem sandbox
-2. Apply the canonical formatter (Black for Python, Prettier for TypeScript) — enforces
-   deterministic roundtrips across whitespace-sensitive languages
+2. Apply the canonical formatter (Black for Python, Prettier for TypeScript)
 3. Feed formatted source to a warm, persistent runtime (Python REPL, Bun process)
-4. Stream stdout, return values, and errors back to the agent
-5. DB remains unchanged unless the agent explicitly commits a new AST edit
+4. OTel SDK — initialized once in the REPL process — emits spans automatically for every
+   call, exception, and slow operation
+5. Spans route to the `traces` table in the same SQLite DB
+6. Stream stdout, return values, and errors back to the agent
+7. DB remains unchanged unless the agent explicitly commits a new AST edit
 
 **REPL staleness:** each commit emits a list of affected module paths. The REPL pool
 marks sessions dirty for those paths. Next eval on a dirty session forces a re-import
 before executing.
+
+**Session replay over step debugging:** agents query the `traces` table to reconstruct
+execution history rather than stepping through a debugger interactively. "Show me all
+spans where processPayment exceeded 100ms" is a SQL query. This is the agent-native
+diagnostic primitive — read the trace, reason over it, form a hypothesis, mutate, verify.
+DAP-based step debugging is available for human handoff but is not the primary agent
+workflow. rr (deterministic record/replay at syscall level) is deferred to V2 for the
+rare class of bugs that require it.
 
 ---
 
@@ -121,9 +153,22 @@ The worktree analog is a reflink copy of the DB file (`cp --reflink` on btrfs/AP
 near-instant). Each branch gets an independent DB file and a corresponding git worktree.
 Agents work in full isolation with no WAL contention between branches.
 
-When two worktrees finish, they materialize, git commit, and reconcile through a normal
-git merge. No new merge problem is introduced — git handles it exactly as it would any
-two branches.
+**Requires a CoW filesystem** (btrfs, APFS, ZFS). Falls back to a full copy on ext4 —
+functional but slower. Document this constraint explicitly for contributors.
+
+```bash
+# bootstrap once per repo
+bunx ast-sqlite hydrate
+
+# every session is a worktree
+bunx ast-sqlite worktree add --branch <name>   # git worktree + reflink db + start MCP
+bunx ast-sqlite worktree materialize           # write files → git commit
+bunx ast-sqlite worktree discard               # git worktree remove + delete db
+```
+
+`worktree discard` calls `git worktree remove` internally — git and db lifecycle stay
+strictly coupled and cannot diverge. The main db is the hydrated base; agents never
+mutate it directly.
 
 Agents can also explore inside an open uncommitted transaction without creating a
 worktree. Mutate, eval, inspect — then commit or rollback for free. The open transaction
@@ -161,7 +206,7 @@ runners. The system handles these with an explicit materialize → run → hydra
 2. **Run the tool** — `bun install`, `tsc`, `pytest`, etc.
 3. **Hydrate** — pull results back into the DB explicitly
 
-**Hydrate:** source files, config files, lockfiles, generated type stubs.  
+**Hydrate:** source files, config files, lockfiles, generated type stubs.
 **Don't hydrate:** `node_modules`, `__pycache__`, `dist`, `.next` — anything
 deterministically derivable from DB state. These reconstruct JIT from the lockfile on
 each sandbox spin-up. The sandbox caches between evals when the lockfile hash is
@@ -171,29 +216,51 @@ unchanged.
 
 ## Language scope (V1)
 
-**TypeScript** — AST via ts-morph or the compiler API, which models trivia including
-comments natively. LSP via tsserver.
+**TypeScript** — CST via ts-morph or the compiler API. LSP via tsserver.
 
-**Python** — AST via libcst, not stdlib `ast`, which strips comments entirely. libcst
-preserves comments as concrete syntax nodes and enables lossless roundtrips. LSP via
-pyright.
+**Python** — CST via libcst (not stdlib `ast`). LSP via pyright.
 
-Each additional language requires: AST schema, materializer, LSP integration. Scope stays
-narrow in V1.
+Each additional language requires: CST-capable parser, AST schema, materializer, LSP
+integration. Scope stays narrow in V1.
 
 ---
 
-## MCP surface
+## MCP and CLI surface
 
-MCP exposes structural-edit and eval tools so any MCP-aware client (Claude Code,
-OpenCode, Cursor) discovers them automatically. Core tools:
+MCP for agents. CLI for humans and CI.
 
-- `session_init()` — return file tree + top-level symbol graph for agent orientation
-- `symbol_query(name)` — return definition + all references
-- `node_mutate(file_id, mutation)` — structural edit with pre-commit LSP validation
-- `eval(expression)` — materialize + run in REPL pool + stream output
-- `snapshot_create(name)` — tag current savepoint
-- `snapshot_restore(id)` — full three-system reset (see above)
+```bash
+# CLI — lifecycle boundaries
+ast-sqlite hydrate
+ast-sqlite worktree add --branch <name>
+ast-sqlite worktree materialize
+ast-sqlite worktree discard
+```
+
+```typescript
+// MCP tools — agent session
+session_init()                                    // file tree + symbol graph
+symbol_query(name)                                // definition + references
+node_mutate(fileId, mutation)                     // structural edit + LSP validation
+eval(expression, language)                        // materialize + REPL + OTel
+snapshot_create(name)                             // tag savepoint
+snapshot_restore(id)                              // full three-system reset
+materialize_to_sandbox(fileIds)                   // for fs-native tool runs
+hydrate_from_sandbox(sandboxPath, paths)          // pull results back
+trace_query(sql)                                  // query OTel spans directly
+```
+
+Add to `.mcp.json` for automatic agent discovery:
+```json
+{
+  "mcpServers": {
+    "ast-sqlite": {
+      "command": "bunx",
+      "args": ["ast-sqlite", "mcp", "--repo", "."]
+    }
+  }
+}
+```
 
 ---
 
