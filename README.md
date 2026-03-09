@@ -370,6 +370,63 @@ integration.
 
 ---
 
+## Validation strategy
+
+Build incrementally. Kill fast. Each phase gates the next.
+
+**The single most important experiment:** Haiku + graph tools vs Opus + context dumping
+on navigation-heavy tasks. If smaller models with graph access don't achieve comparable
+results at meaningfully lower cost, the economic argument for the whole system collapses.
+Everything else is contingent on that holding.
+
+**Phase 1 — Core engine (week 1)**
+
+One TypeScript file. One symbol. Parse → graph → query. If `symbol_query` can't return
+accurate callers in under 500ms, stop. Also gate on roundtrip correctness here, not later
+— `materialize(hydrate(src)) == src` must hold before anything else is built on top. A
+broken roundtrip compounds silently and poisons every subsequent phase.
+
+**Phase 2 — Agent query validation (weeks 2-3)**
+
+Add MCP tools. Run the model equivalence test. Measure token cost reduction.
+
+**Phase 3 — Trace + graph joins (weeks 3-5)**
+
+Add OTel ingestion. Run the performance audit scenario against seeded slow queries. Run
+the security audit scenario against known unvalidated paths. Measure recall.
+
+**Phase 4 — REPL + live development (weeks 5-7)**
+
+Add eval. Test red/green against real trace fixtures vs invented ones. Test the SSR
+hydration mismatch scenario against a codebase with a known bug.
+
+**Phase 5 — Full system (weeks 7-10)**
+
+Swarm atomicity, pre-commit hook overhead, git compatibility end-to-end.
+
+**Kill criteria:**
+
+| Phase | Kill criterion | Decision |
+|-------|---------------|----------|
+| 1 | Hydration > 30s for 10k LOC | Stop |
+| 1 | Roundtrip not lossless | Re-architect before proceeding |
+| 1 | Caller query accuracy < 95% | Re-architect parsing |
+| 2 | No token cost advantage vs context dumping | Reconsider agent model |
+| 3 | Trace queries not faster than manual audit | Rethink approach |
+| 4 | REPL latency > 5s | Not viable for live dev |
+| 5 | Materialization breaks CI | Fix or abandon |
+
+**Known hard problems to expect:**
+
+The REPL model has friction on impure code — side effects, database state, async races.
+The sandbox model helps but doesn't fully solve it. Tree-sitter hydration doesn't resolve
+dynamic imports or decorators (that's the LSP's job), but module resolution across
+monorepos with hoisting will surface edge cases. Materialization correctness on
+pathological CST structures will produce long tail bugs. These are expected, not
+surprises.
+
+---
+
 ## What this is not
 
 A replacement for Git, a new version control system, or a tool for humans editing code
